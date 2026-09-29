@@ -152,4 +152,33 @@ kbd { justify-self: start; padding: 3px 6px; border: 1px solid #c8d2d5; border-b
 .combine-button.selected { color: white; border-color: #9b7244; background: #9b7244; }
 .qwik-check { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid #b9c8cc; border-radius: 4px; background: white; cursor: pointer; }
 .qwik-check[aria-checked="true"] { color: white; border-color: #3d7c89; background: #3d7c89; }
+
+/* 核对口径切换 */
+.scheme-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: white; }
+.scheme-toggle button { padding: 6px 11px; border: 0; border-right: 1px solid var(--line); color: #5a6d74; background: transparent; font-size: 10px; font-weight: 700; }
+.scheme-toggle button:last-child { border-right: 0; }
+.scheme-toggle button.active { color: white; background: var(--cyan); }
+
+/* 关键冲突与方案徽标 */
+.conflict-badge { padding: 2px 6px; border-radius: 8px; color: #9b3d2d; background: #fae3de; font-size: 8px; font-weight: 700; }
+.scheme-badge { padding: 2px 6px; border-radius: 8px; color: #315f77; background: #e0edf3; font-size: 8px; }
+.scheme-tag { margin-left: auto; padding: 3px 7px; border-radius: 6px; color: #315f77; background: #e0edf3; font-size: 8px; font-weight: 700; }
+
+/* 关键冲突提示条 */
+.conflict-banner { display: flex; flex-direction: column; gap: 2px; margin-top: 12px; padding: 9px 11px; border: 1px solid #e8b8ad; border-radius: 8px; background: #fdf1ee; }
+.conflict-banner strong { color: #9b3d2d; font-size: 10px; }
+.conflict-banner span { color: #7a4a40; font-size: 10px; }
+.conflict-banner small { color: #a06a5f; font-size: 8px; }
+
+/* 处理说明输入 */
+.note-field { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.note-field.inline { margin: 0 20px 12px; }
+.note-field label { color: #4e6872; font-size: 9px; font-weight: 700; }
+.note-field .req { color: #b64d3d; }
+.note-field textarea { min-height: 52px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; color: #263b44; background: white; font-size: 10px; font-family: inherit; resize: vertical; outline: none; }
+.note-field textarea:focus { border-color: #5da1af; box-shadow: 0 0 0 3px rgba(49,127,146,.1); }
+.note-field.required textarea { border-color: #e0a396; background: #fdf7f5; }
+.note-field.highlight textarea { border-color: #b64d3d; box-shadow: 0 0 0 3px rgba(182,77,61,.15); }
+.note-field textarea:disabled { color: #6b7b84; background: #f0f3f4; cursor: not-allowed; }
+
 @media (max-width: 1330px) { .desk-grid { grid-template-columns: minmax(330px, 1fr) minmax(380px, 1.15fr) minmax(300px, .85fr); gap: 10px; padding: 0 12px; } .overview, .bottom-grid { padding-left: 12px; padding-right: 12px; } .metrics { gap: 14px; } }

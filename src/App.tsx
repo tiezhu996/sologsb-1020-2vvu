@@ -2,8 +2,8 @@ import {
   $, component$, useComputed$, useSignal, useStore, useVisibleTask$
 } from '@builder.io/qwik';
 import { Checkbox, Modal, Tabs } from '@qwik-ui/headless';
-import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup } from './types';
-import { computeMatches, fieldValue, scorePair } from './utils/matching';
+import type { ArchiveRecord, ArchiveState, FieldKey, MatchCandidate, RecordGroup, ReconciliationScheme } from './types';
+import { computeMatches, detectKeyConflict, fieldValue, rerankSuggested, SCHEME_LABELS } from './utils/matching';
 import { seedState } from './data/seed';
 
 const STORAGE_KEY = 'sologsb-1020-archive-state-v1';
@@ -41,13 +41,15 @@ export default component$(() => {
   const importText = useSignal('');
   const toast = useSignal('');
   const panelTab = useSignal(0);
+  const noteHighlight = useSignal(false);
 
   const snapshot = () => JSON.stringify({
     revision: state.revision,
     records: state.records,
     matches: state.matches,
     merges: state.merges,
-    audit: state.audit
+    audit: state.audit,
+    scheme: state.scheme
   });
 
   const capture = () => {
@@ -62,6 +64,7 @@ export default component$(() => {
     state.matches = next.matches ?? state.matches;
     state.merges = next.merges ?? state.merges;
     state.audit = next.audit ?? state.audit;
+    state.scheme = next.scheme ?? 'identity';
   };
 
   const notify = (message: string) => {
@@ -69,9 +72,9 @@ export default component$(() => {
     window.setTimeout(() => { if (toast.value === message) toast.value = ''; }, 2800);
   };
 
-  const commit = (action: string, detail: string, recordIds: string[] = []) => {
+  const commit = (action: string, detail: string, recordIds: string[] = [], scheme?: ReconciliationScheme, note?: string) => {
     state.revision += 1;
-    state.audit.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), action, detail, recordIds });
+    state.audit.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), action, detail, recordIds, scheme, note });
     state.audit = state.audit.slice(0, 300);
   };
 
@@ -108,35 +111,86 @@ export default component$(() => {
   const activeMatch = useComputed$(() => state.matches.find((match) => match.id === state.activeMatchId) ?? filteredMatches.value[0]);
   const conflictCount = useComputed$(() => state.matches.filter((match) => match.status === 'suggested' && match.score < .68).length);
 
-  const updateMatch = $((id: string, status: MatchCandidate['status']) => {
+  /** 当前选中匹配在当前方案下的关键冲突（实时计算） */
+  const activeConflict = useComputed$(() => {
+    const match = activeMatch.value;
+    if (!match) return { hasConflict: false, reasons: [] as string[] };
+    const left = recordById(state, match.leftId);
+    const right = recordById(state, match.rightId);
+    if (!left || !right) return { hasConflict: false, reasons: [] as string[] };
+    return detectKeyConflict(left, right, state.scheme);
+  });
+
+  /** 切换核对口径：只重排未作结论的候选，已确认/忽略/合并的保持原样 */
+  const switchScheme = $((scheme: ReconciliationScheme) => {
+    if (scheme === state.scheme) return;
     capture();
+    const previous = state.scheme;
+    state.scheme = scheme;
+    state.matches = rerankSuggested(state.records, state.matches, scheme);
+    noteHighlight.value = false;
+    commit('切换核对方案', `从「${SCHEME_LABELS[previous]}」切换到「${SCHEME_LABELS[scheme]}」，仅重排未作结论的候选，已确认/忽略/合并结果保持原样`, []);
+    notify(`已切换到${SCHEME_LABELS[scheme]}，未作结论的候选已重排`);
+  });
+
+  const updateMatch = $((id: string, status: MatchCandidate['status']) => {
     const match = state.matches.find((item) => item.id === id);
     if (!match) return;
+    // 关键冲突（编号不同或人物不重合等）没有处理说明时，不能确认或合并
+    const left = recordById(state, match.leftId);
+    const right = recordById(state, match.rightId);
+    const conflict = left && right ? detectKeyConflict(left, right, state.scheme) : { hasConflict: false, reasons: [] as string[] };
+    if (conflict.hasConflict && status !== 'rejected' && !match.conflictNote?.trim()) {
+      noteHighlight.value = true;
+      notify(`存在关键冲突（${conflict.reasons.join('、')}），请填写处理说明后再${status === 'confirmed' ? '确认' : '合并'}`);
+      return;
+    }
+    noteHighlight.value = false;
+    capture();
+    match.previousStatus = match.status;
     match.status = status;
     match.reviewedAt = new Date().toISOString();
+    match.scheme = state.scheme;
     state.records.forEach((record) => {
       if ((record.id === match.leftId || record.id === match.rightId) && status === 'confirmed') record.status = 'confirmed';
     });
-    commit(status === 'confirmed' ? '确认匹配' : '忽略可疑匹配', matchLabel(state, match), [match.leftId, match.rightId]);
-    notify(status === 'confirmed' ? '已确认此项匹配' : '已忽略此项匹配');
+    const actionLabel = status === 'confirmed' ? '确认匹配' : status === 'rejected' ? '忽略可疑匹配' : '合并两条记录';
+    commit(actionLabel, `${matchLabel(state, match)}${match.conflictNote ? `｜处理说明：${match.conflictNote}` : ''}`, [match.leftId, match.rightId], state.scheme, match.conflictNote);
+    notify(status === 'confirmed' ? '已确认此项匹配' : status === 'rejected' ? '已忽略此项匹配' : '已完成合并');
   });
 
   const bulkMatch = $((status: MatchCandidate['status']) => {
     const ids = selectedMatchIds.value;
     if (!ids.length) return;
-    capture();
+    let skipped = 0;
+    let processed = 0;
+    const skippedReasons: string[] = [];
     ids.forEach((id) => {
       const match = state.matches.find((item) => item.id === id);
       if (!match) return;
+      // 批量操作无法逐条填写处理说明，跳过存在关键冲突且无说明的匹配
+      const left = recordById(state, match.leftId);
+      const right = recordById(state, match.rightId);
+      const conflict = left && right ? detectKeyConflict(left, right, state.scheme) : { hasConflict: false, reasons: [] as string[] };
+      if (conflict.hasConflict && !match.conflictNote?.trim()) {
+        skipped += 1;
+        conflict.reasons.forEach((reason) => { if (!skippedReasons.includes(reason)) skippedReasons.push(reason); });
+        return;
+      }
+      match.previousStatus = match.status;
       match.status = status;
       match.reviewedAt = new Date().toISOString();
+      match.scheme = state.scheme;
+      processed += 1;
     });
-    commit('批量复核', `${ids.length} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}`, ids.flatMap((id) => {
+    capture();
+    commit('批量复核', `${processed} 条匹配被标记为${status === 'confirmed' ? '确认' : '忽略'}${skipped ? `，跳过 ${skipped} 条存在关键冲突的匹配（${skippedReasons.join('、')}，需逐条填写处理说明）` : ''}`, ids.flatMap((id) => {
       const match = state.matches.find((item) => item.id === id);
       return match ? [match.leftId, match.rightId] : [];
-    }));
+    }), state.scheme);
     selectedMatchIds.value = [];
-    notify(`已批量处理 ${ids.length} 条匹配`);
+    noteHighlight.value = false;
+    notify(skipped ? `已批量处理 ${processed} 条，跳过 ${skipped} 条关键冲突匹配（需处理说明）` : `已批量处理 ${processed} 条匹配`);
   });
 
   const openMerge = $(() => {
@@ -162,6 +216,14 @@ export default component$(() => {
     const left = recordById(state, match.leftId);
     const right = recordById(state, match.rightId);
     if (!left || !right) return;
+    // 关键冲突没有处理说明时不能合并
+    const conflict = detectKeyConflict(left, right, state.scheme);
+    if (conflict.hasConflict && !match.conflictNote?.trim()) {
+      noteHighlight.value = true;
+      notify(`存在关键冲突（${conflict.reasons.join('、')}），请填写处理说明后再合并`);
+      return;
+    }
+    noteHighlight.value = false;
     capture();
     const values: Partial<Record<FieldKey, string>> = {};
     fieldLabels.forEach(([field]) => {
@@ -179,7 +241,11 @@ export default component$(() => {
     };
     state.records = [...state.records.filter((record) => record.id !== left.id && record.id !== right.id), merged];
     state.matches.forEach((item) => {
-      if (item.id === match.id) item.status = 'merged';
+      if (item.id === match.id) {
+        item.previousStatus = item.status;
+        item.status = 'merged';
+        item.scheme = state.scheme;
+      }
       else if (item.leftId === left.id || item.rightId === right.id || item.leftId === right.id || item.rightId === left.id) item.status = 'rejected';
     });
     state.merges.unshift({
@@ -189,9 +255,11 @@ export default component$(() => {
       rightId: right.id,
       chosen: { ...choices },
       values,
-      mergedAt: new Date().toISOString()
+      mergedAt: new Date().toISOString(),
+      scheme: state.scheme,
+      conflictNote: match.conflictNote
     });
-    commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段`, [left.id, right.id, merged.id]);
+    commit('合并两条记录', `保留 ${Object.values(choices).filter((choice) => choice === 'A').length} 个 A 来源字段、${Object.values(choices).filter((choice) => choice === 'B').length} 个 B 来源字段${match.conflictNote ? `｜处理说明：${match.conflictNote}` : ''}`, [left.id, right.id, merged.id], state.scheme, match.conflictNote);
     mergeOpen.value = false;
     notify('记录已合并，来源与字段选择已写入审计记录');
   });
@@ -243,8 +311,8 @@ export default component$(() => {
       };
       state.records.push(record);
     });
-    state.matches = computeMatches(state.records);
-    commit('导入档案记录', `从 ${importGroup.value} 组导入 ${rows.length} 条记录`, []);
+    state.matches = computeMatches(state.records, state.scheme);
+    commit('导入档案记录', `从 ${importGroup.value} 组导入 ${rows.length} 条记录`, [], state.scheme);
     importRaw.value = '';
     importText.value = '';
     importOpen.value = false;
@@ -259,7 +327,7 @@ export default component$(() => {
   });
 
   const exportAudit = $(() => {
-    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), scheme: state.scheme, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -292,7 +360,7 @@ export default component$(() => {
   });
 
   useVisibleTask$(({ track }) => {
-    const payload = track(() => JSON.stringify({ revision: state.revision, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit }));
+    const payload = track(() => JSON.stringify({ revision: state.revision, records: state.records, matches: state.matches, merges: state.merges, audit: state.audit, scheme: state.scheme }));
     if (state.hydrated) localStorage.setItem(STORAGE_KEY, payload);
   });
 
@@ -353,6 +421,10 @@ export default component$(() => {
             <span class="shortcut-hint">J / K 移动 · Enter 合并</span>
           </div>
           <div class="toolbar-row">
+            <div class="scheme-toggle" role="group" aria-label="核对口径" title="切换核对口径，仅重排未作结论的候选">
+              <button class={state.scheme === 'identity' ? 'active' : ''} onClick$={() => switchScheme('identity')}>身份优先</button>
+              <button class={state.scheme === 'content' ? 'active' : ''} onClick$={() => switchScheme('content')}>内容优先</button>
+            </div>
             <select class="input" value={statusFilter.value} onChange$={(event) => { statusFilter.value = (event.target as HTMLSelectElement).value as typeof statusFilter.value; }}>
               <option value="all">全部匹配</option><option value="suggested">待复核</option><option value="confirmed">已确认</option><option value="rejected">已忽略</option>
             </select>
@@ -384,6 +456,8 @@ export default component$(() => {
                       }}
                     ><Checkbox.Indicator>✓</Checkbox.Indicator></Checkbox.Root>
                     <span class={`score ${match.score < .68 ? 'low' : ''}`}>{Math.round(match.score * 100)}%</span>
+                    {match.keyConflict && <span class="conflict-badge" title={match.keyConflictReasons?.join('、')}>关键冲突</span>}
+                    {match.scheme && match.status !== 'suggested' && <span class="scheme-badge" title="作出结论时使用的核对口径">{SCHEME_LABELS[match.scheme]}</span>}
                     <span class={`status ${match.status}`}>{match.status === 'suggested' ? '待复核' : match.status === 'confirmed' ? '已确认' : match.status === 'rejected' ? '已忽略' : '已合并'}</span>
                     <span class="record-id">{left?.identifier}</span>
                   </div>
@@ -431,14 +505,32 @@ export default component$(() => {
             <Tabs.List class="tab-list"><Tabs.Tab>复核详情</Tabs.Tab><Tabs.Tab>合并追溯</Tabs.Tab><Tabs.Tab>键盘帮助</Tabs.Tab></Tabs.List>
             <Tabs.Panel class="tab-panel">
               {activeMatch.value ? (() => {
-                const left = recordById(state, activeMatch.value!.leftId)!;
-                const right = recordById(state, activeMatch.value!.rightId)!;
+                const match = activeMatch.value!;
+                const left = recordById(state, match.leftId)!;
+                const right = recordById(state, match.rightId)!;
+                const conflict = activeConflict.value;
                 return <>
-                  <div class="active-score"><span>{Math.round(activeMatch.value!.score * 100)}</span><div><strong>综合匹配分</strong><small>{activeMatch.value!.reasons.join(' · ')}</small></div></div>
+                  <div class="active-score"><span>{Math.round(match.score * 100)}</span><div><strong>综合匹配分</strong><small>{match.reasons.join(' · ')}</small></div>{match.scheme && match.status !== 'suggested' && <span class="scheme-tag">{SCHEME_LABELS[match.scheme]}口径</span>}</div>
                   <div class="field-compare compact"><div class="field-label">字段</div><div>A 来源</div><div>B 来源</div>
                     {fieldLabels.map(([field, label]) => <><div class="field-label">{label}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(left, field) || '—'}</div><div class={fieldValue(left, field) !== fieldValue(right, field) ? 'different' : ''}>{fieldValue(right, field) || '—'}</div></>)}
                   </div>
-                  <div class="action-stack"><button class="button primary wide" onClick$={openMerge}>逐字段合并</button><div class="split-actions"><button class="button confirm" onClick$={() => updateMatch(activeMatch.value!.id, 'confirmed')}>确认匹配</button><button class="button ghost" onClick$={() => updateMatch(activeMatch.value!.id, 'rejected')}>忽略</button></div></div>
+                  {conflict.hasConflict && (
+                    <div class="conflict-banner">
+                      <strong>关键冲突</strong>
+                      <span>{conflict.reasons.join('、')}</span>
+                      <small>存在关键冲突时，确认或合并必须填写处理说明。</small>
+                    </div>
+                  )}
+                  <div class={`note-field ${noteHighlight.value ? 'highlight' : ''} ${conflict.hasConflict ? 'required' : ''}`}>
+                    <label>处理说明{conflict.hasConflict && <span class="req">*</span>}</label>
+                    <textarea
+                      placeholder={conflict.hasConflict ? `存在关键冲突（${conflict.reasons.join('、')}），请说明为何仍确认或合并` : '可选：记录处理说明，随结论一起保存'}
+                      value={match.conflictNote ?? ''}
+                      onInput$={(event) => { match.conflictNote = (event.target as HTMLTextAreaElement).value; noteHighlight.value = false; }}
+                      disabled={match.status !== 'suggested'}
+                    />
+                  </div>
+                  <div class="action-stack"><button class="button primary wide" onClick$={openMerge}>逐字段合并</button><div class="split-actions"><button class="button confirm" onClick$={() => updateMatch(match.id, 'confirmed')}>确认匹配</button><button class="button ghost" onClick$={() => updateMatch(match.id, 'rejected')}>忽略</button></div></div>
                 </>;
               })() : <div class="empty-state">从左侧选择一条匹配查看字段来源。</div>}
             </Tabs.Panel>
@@ -465,10 +557,10 @@ export default component$(() => {
         </article>
         <article class="panel explanation-panel">
           <div class="panel-heading"><div><span class="eyebrow">METHOD</span><h3>匹配与保护规则</h3></div></div>
-          <p>标题、日期、人物、地点和编号按权重综合评分。低于 68% 的候选会以红色标记，但系统不会替研究者自动决定。</p>
-          <div class="rule-row"><span>1</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
-          <div class="rule-row"><span>2</span><p>原始记录、合并结果和忽略理由都进入本地审计轨迹。</p></div>
-          <div class="rule-row"><span>3</span><p>记录列表使用分批窗口渲染，导入大量数据时仍只挂载当前窗口。</p></div>
+          <p>核对口径可切换：<strong>身份优先</strong>侧重编号与人物，编号不同或人物不重合即标记关键冲突；<strong>内容优先</strong>侧重标题、日期与地点。切换只重排未作结论的候选，已确认、忽略或合并的结果保持原样，并记录当时方案。</p>
+          <div class="rule-row"><span>1</span><p>关键冲突没有处理说明时不能确认或合并；批量操作会跳过并说明数量。</p></div>
+          <div class="rule-row"><span>2</span><p>处理说明、旧结论和当前方案一起保存，支持撤销重做与导出。</p></div>
+          <div class="rule-row"><span>3</span><p>每个字段保留 A / B 来源，可在合并窗口中单独选择或拼接。</p></div>
         </article>
       </section>
 
@@ -493,10 +585,27 @@ export default component$(() => {
         <Modal.Panel class="modal-panel merge-modal">
           <Modal.Header class="modal-header"><div><span class="eyebrow">FIELD MERGE</span><Modal.Title>逐字段选择保留来源</Modal.Title></div><Modal.Close class="modal-close">×</Modal.Close></Modal.Header>
           {activeMatch.value && (() => {
-            const left = recordById(state, activeMatch.value!.leftId)!;
-            const right = recordById(state, activeMatch.value!.rightId)!;
+            const match = activeMatch.value!;
+            const left = recordById(state, match.leftId)!;
+            const right = recordById(state, match.rightId)!;
+            const conflict = activeConflict.value;
             return <>
               <Modal.Description class="modal-description">每个字段都显示两条记录的原始来源。选择后，生成一条新合并记录，原记录编号与选择依据仍保留在审计轨迹中。</Modal.Description>
+              {conflict.hasConflict && (
+                <div class="conflict-banner">
+                  <strong>关键冲突</strong>
+                  <span>{conflict.reasons.join('、')}</span>
+                  <small>存在关键冲突时，合并必须填写处理说明。</small>
+                </div>
+              )}
+              <div class={`note-field inline ${noteHighlight.value ? 'highlight' : ''} ${conflict.hasConflict ? 'required' : ''}`}>
+                <label>处理说明{conflict.hasConflict && <span class="req">*</span>}</label>
+                <textarea
+                  placeholder={conflict.hasConflict ? `存在关键冲突（${conflict.reasons.join('、')}），请说明为何仍合并` : '可选：记录处理说明，随合并结果一起保存'}
+                  value={match.conflictNote ?? ''}
+                  onInput$={(event) => { match.conflictNote = (event.target as HTMLTextAreaElement).value; noteHighlight.value = false; }}
+                />
+              </div>
               <div class="field-picker-head"><span>字段</span><span>A 组来源</span><span>B 组来源</span></div>
               <div class="field-picker">
                 {fieldLabels.map(([field, label]) => {
